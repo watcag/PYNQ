@@ -78,8 +78,7 @@ class PynqBuffer(np.ndarray):
             else:
                 if not self.freed:
                     self.freed = True
-                    libc.munmap(ctypes.cast(self.virtual_address, ctypes.c_void_p), self.nbytes)
-                    xrt.xclFreeBO(self.device.handle, self.bo)
+                    self.device.free_bo(self.bo)
 
 
     @property

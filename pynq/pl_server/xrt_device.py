@@ -28,6 +28,35 @@ libc = ctypes.CDLL("libc.so.6")
 libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
 libc.munmap.restype = ctypes.c_int
 
+# Recent XRT (2.23 checked) no longer exports the xcl* functions of _3rdparty/xrt.py; libpynq_xrt.so
+# (pynq_xrt.cpp, built next to this file) wraps the XRT native API instead.
+_shim = None
+if xrt.XRT_SUPPORTED and CPU_ARCH_IS_x86:
+    _shim = ctypes.CDLL(os.path.join(os.path.dirname(__file__), "libpynq_xrt.so"))
+    for _f in ("pxrt_open", "pxrt_bo", "pxrt_bo_map", "pxrt_ip"):
+        getattr(_shim, _f).restype = ctypes.c_void_p
+    _shim.pxrt_error.restype = ctypes.c_char_p
+    _shim.pxrt_bo_size.restype = ctypes.c_size_t
+    _shim.pxrt_bo_address.restype = ctypes.c_uint64
+    _shim.pxrt_open.argtypes = [ctypes.c_uint]
+    _shim.pxrt_bo.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
+    _shim.pxrt_bo_sync.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t, ctypes.c_size_t]
+    _shim.pxrt_bo_write.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t]
+    _shim.pxrt_bo_read.argtypes = _shim.pxrt_bo_write.argtypes
+    _shim.pxrt_ip_read.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32)]
+    _shim.pxrt_ip_write.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32]
+    for _f in ("pxrt_close", "pxrt_name", "pxrt_load", "pxrt_bo_free", "pxrt_bo_map", "pxrt_bo_size",
+               "pxrt_bo_address", "pxrt_ip", "pxrt_ip_free"):
+        getattr(_shim, _f).argtypes = [ctypes.c_void_p] + {
+            "pxrt_name": [ctypes.c_char_p, ctypes.c_size_t], "pxrt_load": [ctypes.c_char_p],
+            "pxrt_ip": [ctypes.c_char_p]}.get(_f, [])
+
+
+def _check(ok):
+    if not ok:
+        raise RuntimeError("XRT: " + _shim.pxrt_error().decode())
+    return ok
+
 
 # Create our own struct that fixes the typos of the real one
 class xclDeviceUsage(ctypes.Structure):
@@ -122,8 +151,7 @@ def _xrt_allocate(shape, dtype, device, memidx, cacheable=0, pointer=None, cache
 
 
 def _free_bo(device, bo, ptr, length):
-    libc.munmap(ctypes.cast(ptr, ctypes.c_void_p), length)
-    xrt.xclFreeBO(device.handle, bo)
+    device.free_bo(bo)
 
 
 class XrtMemory:
@@ -296,13 +324,17 @@ class XrtStream:
 
 
 class XrtDevice(Device):
+    """Alveo card through recent XRT (libpynq_xrt.so over the XRT native API).
+
+    The xclbin is loaded into one exclusive hardware context and every kernel is
+    driven through its registers (xrt::ip): no ERT commands.
+    """
+
     @classmethod
     def _probe_(cls):
         if not xrt.XRT_SUPPORTED or not CPU_ARCH_IS_x86:
             return []
-        num = xrt.xclProbe()
-        devices = [XrtDevice(i) for i in range(num)]
-        return devices
+        return [XrtDevice(i) for i in range(_shim.pxrt_count())]
 
     _probe_priority_ = 200
 
@@ -312,60 +344,25 @@ class XrtDevice(Device):
             "REGISTER_RW": True,
             "CALLABLE": True,
         }
-        if _xrt_version >= REQUIRED_VERSION_ERT:
-            self.capabilities["ERT"] = True
         self._index = index
-        self._get_handle()
-        self._info = xrt.xclDeviceInfo2()
-        xrt.xclGetDeviceInfo2(self.handle, self._info)
+        self.handle = _check(_shim.pxrt_open(index))
+        name = ctypes.create_string_buffer(256)
+        _check(_shim.pxrt_name(self.handle, name, 256) == 0)
+        self._name = name.value.decode()
         self.contexts = dict()
-        self._find_sysfs()
+        self.sysfs_path = None
         self.active_bos = []
         self._bo_cache = []
         self._loop = asyncio.get_event_loop()
         self._streams = {}
 
-    def _get_handle(self):
-        self.handle = xrt.xclOpen(self._index, None, 0)
-
-    def _find_sysfs(self):
-        devices = glob.glob("/sys/bus/pci/drivers/xclmgmt/*:*")
-        self.sysfs_path = None
-        for d in devices:
-            with open(os.path.join(d, "slot")) as f:
-                slot = int(f.read())
-            if slot == self._info.mPciSlot:
-                self.sysfs_path = os.path.realpath(d)
-
-    @property
-    def device_info(self):
-        info = xrt.xclDeviceInfo2()
-        xrt.xclGetDeviceInfo2(self.handle, info)
-        return info
-
     @property
     def name(self):
-        return self._info.mName.decode()
+        return self._name
 
     @property
     def clocks(self):
-        """Runtime clocks. This dictionary provides the actual
-        clock frequencies that the hardware is running at.
-        Frequencies are expressed in Mega Hertz.
-        """
-        clks = {}
-        idx = 0
-        for clk in self._info.mOCLFrequency:
-            if clk != 0:
-                clks["clock" + str(idx)] = {"frequency": clk}
-                idx += 1
-        return clks
-
-    @property
-    def sensors(self):
-        from pynq.pmbus import get_xrt_sysfs_rails
-
-        return get_xrt_sysfs_rails(self)
+        return {}
 
     @property
     def default_memory(self):
@@ -381,86 +378,42 @@ class XrtDevice(Device):
         return self.get_memory(active_mems[0])
 
     def flush(self, bo, offset, ptr, size):
-        ret = xrt.xclSyncBO(
-            self.handle,
-            bo,
-            xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE,
-            size,
-            offset,
-        )
-        if ret >= 0x80000000:
-            raise RuntimeError("Flush Failed: " + str(ret))
+        _check(_shim.pxrt_bo_sync(bo, 1, size, offset) == 0)
 
     def invalidate(self, bo, offset, ptr, size):
-        ret = xrt.xclSyncBO(
-            self.handle,
-            bo,
-            xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE,
-            size,
-            offset,
-        )
-        if ret >= 0x80000000:
-            raise RuntimeError("Invalidate Failed: " + str(ret))
+        _check(_shim.pxrt_bo_sync(bo, 0, size, offset) == 0)
 
     def allocate_bo(self, size, idx, cacheable):
-        if cacheable:
-            idx |= ZOCL_BO_FLAGS_CACHEABLE
-        bo = xrt.xclAllocBO(self.handle, size, xrt.xclBOKind.XCL_BO_DEVICE_RAM, idx)
-        if bo >= 0x80000000:
-            raise RuntimeError("Allocate failed: " + str(bo))
-        return bo
+        return _check(_shim.pxrt_bo(self.handle, size, idx))
+
+    def free_bo(self, bo):
+        _shim.pxrt_bo_free(bo)
 
     def buffer_write(self, bo, bo_offset, buf, buf_offset=0, count=-1):
         view = memoryview(buf).cast("B")
-        if count == -1:
-            view = view[buf_offset:]
-        else:
-            view = view[buf_offset : buf_offset + count]
+        view = view[buf_offset:] if count == -1 else view[buf_offset : buf_offset + count]
         ptr = (ctypes.c_char * len(view)).from_buffer(view)
-        status = xrt.xclWriteBO(self.handle, bo, ptr, len(view), bo_offset)
-        if status != 0:
-            raise RuntimeError("Buffer Write Failed: " + str(status))
+        _check(_shim.pxrt_bo_write(bo, ptr, len(view), bo_offset) == 0)
 
     def buffer_read(self, bo, bo_offset, buf, buf_offset=0, count=-1):
         view = memoryview(buf).cast("B")
         if view.readonly:
             raise RuntimeError("Buffer not writable")
-        if count == -1:
-            view = view[buf_offset:]
-        else:
-            view = view[buf_offset : buf_offset + count]
+        view = view[buf_offset:] if count == -1 else view[buf_offset : buf_offset + count]
         ptr = (ctypes.c_char * len(view)).from_buffer(view)
-        status = xrt.xclReadBO(self.handle, bo, ptr, len(view), bo_offset)
-        if status != 0:
-            raise RuntimeError("Buffer Write Failed: " + str(status))
+        _check(_shim.pxrt_bo_read(bo, ptr, len(view), bo_offset) == 0)
 
     def map_bo(self, bo):
-        ptr = xrt.xclMapBO(self.handle, bo, True)
-        prop = xrt.xclBOProperties()
-        if xrt.xclGetBOProperties(self.handle, bo, prop):
-            raise RuntimeError("Failed to get buffer properties")
-        size = prop.size
-        casted = ctypes.cast(ptr, ctypes.POINTER(ctypes.c_char * size))
-        return casted[0]
+        ptr = _check(_shim.pxrt_bo_map(bo))
+        return ctypes.cast(ptr, ctypes.POINTER(ctypes.c_char * _shim.pxrt_bo_size(bo)))[0]
 
     def get_device_address(self, bo):
-        prop = xrt.xclBOProperties()
-        xrt.xclGetBOProperties(self.handle, bo, prop)
-        return prop.paddr
-
-    def get_usage(self):
-        usage = xclDeviceUsage()
-        status = xrt.xclGetUsageInfo(
-            self.handle,
-            ctypes.cast(ctypes.pointer(usage), ctypes.POINTER(xrt.xclDeviceInfo2)),
-        )
-        if status != 0:
-            raise RuntimeError("Get Usage Failed: " + str(status))
-        return usage
+        return _shim.pxrt_bo_address(bo)
 
     def close(self):
+        self.free_bitstream()
         if self.handle:
-            xrt.xclClose(self.handle)
+            _shim.pxrt_close(self.handle)
         self.handle = None
 
     def get_memory(self, desc):
@@ -483,103 +436,56 @@ class XrtDevice(Device):
                 return self.get_memory(m)
         raise RuntimeError("Could not find memory")
 
+    def _ip_at(self, address):
+        for c in self.contexts.values():
+            if c["base"] <= address < c["base"] + c["range"]:
+                return c["ip"], address - c["base"]
+        raise RuntimeError("No open compute unit at address 0x{:x}".format(address))
+
     def read_registers(self, address, length):
-        data = (ctypes.c_char * length)()
-        ret = xrt.xclRead(
-            self.handle, xrt.xclAddressSpace.XCL_ADDR_KERNEL_CTRL, address, data, length
-        )
-        return bytes(data)
+        ip, offset = self._ip_at(address)
+        value = ctypes.c_uint32()
+        data = b""
+        for o in range(offset, offset + length, 4):
+            _check(_shim.pxrt_ip_read(ip, o, ctypes.byref(value)) == 0)
+            data += value.value.to_bytes(4, "little")
+        return data[:length]
 
     def write_registers(self, address, data):
-        cdata = (ctypes.c_char * len(data)).from_buffer_copy(data)
-        xrt.xclWrite(
-            self.handle,
-            xrt.xclAddressSpace.XCL_ADDR_KERNEL_CTRL,
-            address,
-            cdata,
-            len(data),
-        )
+        ip, offset = self._ip_at(address)
+        for i in range(0, len(data), 4):
+            word = int.from_bytes(data[i : i + 4], "little")
+            _check(_shim.pxrt_ip_write(ip, offset + i, word) == 0)
 
     def free_bitstream(self):
-        for k, v in self.contexts.items():
-            xrt.xclCloseContext(self.handle, v["uuid_ctypes"], v["idx"])
+        for c in self.contexts.values():
+            _shim.pxrt_ip_free(c["ip"])
         self.contexts = dict()
-
-    def _xrt_download(self, data):
-        # Keep copy of old contexts so we can reacquire them if
-        # downloading fails
-        old_contexts = copy.deepcopy(self.contexts)
-        # Close existing contexts
-        for k, v in self.contexts.items():
-            xrt.xclCloseContext(self.handle, v["uuid_ctypes"], v["idx"])
-        self.contexts = dict()
-
-        # Download xclbin file
-        if not self.handle:
-            self._get_handle()
-        err = xrt.xclLockDevice(self.handle)
-        if err:
-            raise RuntimeError("Could not lock device for programming - " + str(err))
-        try:
-            err = xrt.xclLoadXclBin(self.handle, data)
-            if err:
-                for k, v in old_contexts:
-                    xrt.xclOpenContext(self.handle, v["uuid_ctypes"], v["idx"], True)
-                self.contexts = old_contexts
-                raise RuntimeError(
-                    "Programming Device failed: " + _format_xrt_error(err)
-                )
-        finally:
-            xrt.xclUnlockDevice(self.handle)
 
     def gen_cache(self, bitstream, parser=None):
         pass
 
     def download(self, bitstream, parser=None):
-        with open(bitstream.bitfile_name, "rb") as f:
-            data = f.read()
-        self._xrt_download(data)
+        self.free_bitstream()
+        _check(_shim.pxrt_load(self.handle, bitstream.bitfile_name.encode()) == 0)
         super().post_download(bitstream, parser)
 
     def open_context(self, description, shared=True):
-        """Open XRT context for the compute unit"""
-
+        """Reserve the compute unit and map its registers (exclusive)"""
         cu_name = description["cu_name"]
-        context = self.contexts.get(cu_name)
-        if context:
-            return context["idx"]
-        if _xrt_version >= (2, 6, 0):
-            cu_index = xrt.xclIPName2Index(self.handle, cu_name)
-            description["cu_index"] = cu_index
-        else:
-            cu_index = description["cu_index"]
-
-        uuid = bytes.fromhex(description["xclbin_uuid"])
-        uuid_ctypes = XrtUUID((ctypes.c_char * 16).from_buffer_copy(uuid))
-        err = xrt.xclOpenContext(self.handle, uuid_ctypes, cu_index, shared)
-
-        if err:
-            raise RuntimeError(
-                "Could not open CU context - {}, {}".format(err, cu_index)
-            )
-        # Setup the execution context for the compute unit
-        self.contexts[cu_name] = {
-            "cu": cu_name,
-            "idx": cu_index,
-            "uuid_ctypes": uuid_ctypes,
-            "shared": shared,
-        }
-
-        return cu_index
+        if cu_name not in self.contexts:
+            kernel, _, inst = cu_name.partition(":")
+            ip = _check(_shim.pxrt_ip(self.handle, "{}:{{{}}}".format(kernel, inst).encode()))
+            self.contexts[cu_name] = {
+                "ip": ip,
+                "idx": description["cu_index"],
+                "base": description["phys_addr"],
+                "range": description["addr_range"],
+            }
+        return self.contexts[cu_name]["idx"]
 
     def close_context(self, cu_name):
-        """Close XRT context for the compute unit"""
-
-        context = self.contexts.get(cu_name)
-        if context is None:
-            raise RuntimeError("CU context ({}) is not open.".format(cu_name))
-        xrt.xclCloseContext(self.handle, context["uuid_ctypes"], context["idx"])
-        self.contexts.pop(cu_name)
+        _shim.pxrt_ip_free(self.contexts.pop(cu_name)["ip"])
 
     def get_bitfile_metadata(self, bitfile_name):
         from .xclbin_parser import XclBin

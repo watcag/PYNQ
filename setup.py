@@ -24,7 +24,10 @@ required = [
     "cffi",
     "numpy",
     "nest_asyncio",
+    "pycparser<3",
 ]
+
+XRT_ROOT = os.environ.get("XILINX_XRT", "/opt/xilinx/xrt")
 
 # Device family constants
 ZYNQ_ARCH = "armv7l"
@@ -363,6 +366,8 @@ class BuildExtension(build_ext):
             self.run_make("pynq/lib/_pynq/_audio/", "pynq/lib/", "libaudio.so")
             self.run_make("pynq/lib/_pynq/_xiic/", "pynq/lib/", "libiic.so")
             self.run_make("pynq/lib/_pynq/_pcam5c/", "pynq/lib/video/", "libpcam5c.so")
+        elif os.path.isdir(os.path.join(XRT_ROOT, "include", "xrt")):
+            self.run_make("pynq/pl_server/_xrt/", "pynq/pl_server/", "libpynq_xrt.so")
         build_ext.run(self)
         copy_notebooks()
         self.install_overlays()
@@ -401,6 +406,7 @@ extend_pynq_package(
         "pynq/lib/_pynq/_xhdmi",
         "pynq/lib/_pynq/_xiic",
         "pynq/lib/_pynq/_pcam5c",
+        "pynq/pl_server/_xrt",
         "pynq/notebooks",
         "pynq/tests",
         "pynq/metadata",

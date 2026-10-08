@@ -660,6 +660,8 @@ class WaitHandle:
     def wait(self):
         while self.target.mmio.read(0) & 0x4 != 0x4:
             pass
+        if "AP_CONTINUE" in self.target._registers["CTRL"]["fields"]:
+            self.target.mmio.write(0, 0x10)  # ap_ctrl_chain: release ap_done, or the next start blocks
 
 
 class DefaultIP(metaclass=RegisterIP):

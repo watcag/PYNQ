@@ -1,3 +1,15 @@
+> **This fork (branch `xrt-native`)** is PYNQ 3.0.1, the last release with Alveo support, ported to the XRT
+> native API so it runs on current XRT (2.23 checked), which no longer exports the `xcl*` functions 3.0.1 binds.
+> `XrtDevice` goes through a small C library (`pynq/pl_server/_xrt`, built by `pip install` when XRT is
+> installed: `XILINX_XRT`, default `/opt/xilinx/xrt`): device, buffers, one exclusive hardware context, and
+> compute-unit registers via `xrt::ip`. Kernels start through PYNQ's register path (`call`/`start`/`wait`,
+> `ap_continue` for `ap_ctrl_chain`), so `ap_ctrl_none` and user-managed kernels work too; no ERT commands.
+> Tested on an Alveo U280 (XRT 2.23, Ubuntu 24.04): `Overlay("design.xclbin")`, `allocate(target=ol.HBM0)`,
+> register-started kernels, bit-exact against reference outputs.
+>
+>     source /opt/xilinx/xrt/setup.sh
+>     pip install "git+https://github.com/watcag/PYNQ@xrt-native"
+
 ![pynq_logo](https://github.com/Xilinx/PYNQ/raw/master/logo.png)
 
 ![python](https://github.com/Xilinx/PYNQ/workflows/Python/badge.svg)
