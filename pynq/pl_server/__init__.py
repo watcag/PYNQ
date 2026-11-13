@@ -19,6 +19,7 @@ if os.environ.get("XILINX_XRT", False):
     from .versal_device import VersalDevice
     from .xclbin_parser import XclBin
     from .xrt_device import XrtDevice
+    from .xrt_native_device import XrtNativeDevice
 
 if os.environ.get("PYNQ_REMOTE_DEVICES", False):
     from .remote_device import RemoteDevice

@@ -78,8 +78,13 @@ class PynqBuffer(np.ndarray):
             else:
                 if not self.freed:
                     self.freed = True
-                    libc.munmap(ctypes.cast(self.virtual_address, ctypes.c_void_p), self.nbytes)
-                    del self.bo
+                    if hasattr(self.device, "free_bo"):
+                        # XrtNativeDevice: the XRT buffer object owns its mapping
+                        # (libc is bound only on embedded targets).
+                        self.device.free_bo(self.bo)
+                    else:
+                        libc.munmap(ctypes.cast(self.virtual_address, ctypes.c_void_p), self.nbytes)
+                        del self.bo
 
 
     @property
