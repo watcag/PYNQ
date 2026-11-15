@@ -661,6 +661,8 @@ class WaitHandle:
     def wait(self):
         while self.target.mmio.read(0) & 0x4 != 0x4:
             pass
+        if "AP_CONTINUE" in self.target._registers["CTRL"]["fields"]:
+            self.target.mmio.write(0, 0x10)  # ap_ctrl_chain: release ap_done, or the next start blocks
 
 
 class DefaultIP(metaclass=RegisterIP):
@@ -716,6 +718,20 @@ class DefaultIP(metaclass=RegisterIP):
             self._registers = description["registers"]
             self._fullpath = description["fullpath"]
             self._register_name = description["fullpath"].rpartition("/")[2]
+            if "CTRL" in self._registers and self.device.has_capability("CALLABLE"):
+                # PYNQ 4.0 dropped call/start with the ERT path; a CALLABLE device
+                # (XrtNativeDevice) starts kernels through their registers.
+                (
+                    self._signature,
+                    struct_string,
+                    self._ptr_list,
+                    self.args,
+                ) = _create_call(self._registers)
+                self._call_struct = struct.Struct(struct_string)
+                self._ctrl_reg = True
+                self.start_sw = self._start_sw
+                self.start = self._start_sw
+                self.call = self._call
         else:
             self._registers = None
         if "index" in description:
@@ -754,6 +770,38 @@ class DefaultIP(metaclass=RegisterIP):
 
     def _call(self, *args, **kwargs):
         self.start(*args, **kwargs).wait()
+
+    def _start_sw(self, *args, ap_ctrl=1, waitfor=None, **kwargs):
+        """Start the accelerator
+
+        This function will configure the accelerator with the provided
+        arguments and start the accelerator. Use the `wait` function to
+        determine when execution has finished. Note that buffers should be
+        flushed prior to starting the accelerator and any result buffers
+        will need to be invalidated afterwards.
+
+        For details on the function's signature use the `signature` property.
+        The type annotations provide the C types that the accelerator
+        operates on. Any pointer types should be passed as `ContiguousArray`
+        objects created from the `pynq.allocate` class. Scalars should be
+        passed as a compatible python type as used by the `struct` library.
+
+        """
+        if not self._signature:
+            raise RuntimeError("Only HLS IP can be called with the wrapper")
+        if waitfor is not None:
+            raise RuntimeError("waitfor needs the ERT scheduler, which this device does not use")
+        if kwargs:
+            # Resolve any kwargs to make a single args tuple
+            args = self._signature.bind(*args, **kwargs).args
+        # Resolve and pointers that need .device_address taken
+        args = [
+            a.device_address if p else a
+            for a, p in itertools.zip_longest(args, self._ptr_list)
+        ]
+        self.mmio.write(0, self._call_struct.pack(0, *args))
+        self.mmio.write(0, ap_ctrl)
+        return WaitHandle(self)
 
     def read(self, offset=0):
         """Read from the MMIO device

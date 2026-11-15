@@ -89,6 +89,9 @@ def _xrt_allocate(shape, dtype, device, memidx, cacheable=0, pointer=None, cache
 
 
 def _free_bo(device, bo, ptr, length):
+    if hasattr(device, "free_bo"):
+        device.free_bo(bo)
+        return
     libc.munmap(ctypes.cast(ptr, ctypes.c_void_p), length)
     del bo
     

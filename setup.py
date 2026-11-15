@@ -31,6 +31,7 @@ required = [
 ]
 
 REMOTE_INSTALL = os.environ.get("PYNQ_REMOTE", False)
+XRT_ROOT = os.environ.get("XILINX_XRT", "/opt/xilinx/xrt")
 
 ZU_ARCH = "aarch64"
 if "PYNQ_BUILD_ARCH" in os.environ:
@@ -312,6 +313,9 @@ class BuildExtension(build_ext):
                 self.run_make("pynq/lib/_pynq/_xhdmi/", "pynq/lib/video/", "libxhdmi.so")
                 self.run_make("pynq/lib/_pynq/_audio/", "pynq/lib/", "libaudio.so")
                 self.run_make("pynq/lib/_pynq/_xiic/", "pynq/lib/", "libiic.so")
+            elif os.path.isdir(os.path.join(XRT_ROOT, "include", "xrt")):
+                # Alveo hosts: XrtNativeDevice's libpynq_xrt.so over the XRT native API
+                self.run_make("pynq/pl_server/_xrt/", "pynq/pl_server/", "libpynq_xrt.so")
         else:
             self.announce("Remote install, skipping native C/C++ builds", level=2)
 
@@ -350,6 +354,7 @@ extend_pynq_package(
         "pynq/lib/_pynq/_displayport",
         "pynq/lib/_pynq/_xhdmi",
         "pynq/lib/_pynq/_xiic",
+        "pynq/pl_server/_xrt",
         "pynq/notebooks",
         "pynq/tests",
         "pynq/metadata",
